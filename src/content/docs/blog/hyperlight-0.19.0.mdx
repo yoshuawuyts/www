@@ -1,0 +1,125 @@
+---
+title: "Announcing Hyperlight 0.19.0"
+date: 2026-11-05
+---
+
+# Announcing Hyperlight 0.19.0
+
+_Hyperlight is a lightweight Virtual Machine Manager (VMM) designed to be
+embedded directly in applications. It enables safe execution of untrusted code
+with low latency and minimal overhead._
+
+Hyperlight 0.19.0 has been released! This release includes significantly faster
+snapshots, enables memory reuse between snapshots, lets you resize scratch
+memory on snapshot, and changes the way guest heaps are laid out. To view the
+full list of changes, please see the [_0.19.0
+changelog_](https://github.com/hyperlight-dev/hyperlight/blob/v0.19.0/CHANGELOG.md#v0190---2026-11-04).
+
+## Faster snapshot creation and restore
+
+Snapshots in this release have gotten a significant speed-up. In some cases
+latency has been reduced by as much as 99% (171 ms → 1.7 ms). Here are our
+benchmark results targeting both MSHV on Linux 6.6 and KVM on Linux 6.17:
+
+| Benchmark                           | MSHV                    | KVM                     |
+| ----------------------------------- | ----------------------- | ----------------------- |
+| `snapshots/create/default`          | 440 µs → 249 µs (−43%)  | 380 µs → 262 µs (−31%)  |
+| `snapshots/create/large`            | 171 ms → 1.68 ms (−99%) | 162 ms → 1.7 ms (−99%)  |
+| `snapshots/call_and_create/medium`  | 38.1 ms → 726 µs (−98%) | 35 ms → 778 µs (−98%)   |
+| `snapshots/restore_alternate/large` | 4.41 ms → 106 µs (−98%) | 1.66 ms → 131 µs (−92%) |
+| `snapshots/restore/large`           | 1.2 ms → 91.6 µs (−92%) | 403 µs → 52 µs (−87%)   |
+
+There are however some downsides to these changes: the `load_snapshot` benchmark
+has seen a 14% regression, and the `save_snapshot` benchmark has seen a 10–22%
+regression. We believe those regressions are acceptable given how much faster
+it’s made the other snapshot operations. And we expect to be able to speed these
+operations up again in future patches.
+
+## Layered snapshots
+
+Snapshots can now share memory between multiple layers using copy-on-write
+semantics. This can greatly reduce memory usage when working with guests that
+have a relatively big immutable part that is loaded as part of every guest. For
+example: JavaScript workloads on Hyperlight now only have to pay the memory cost
+for loading the JS runtime once, even if the workloads themselves are different.
+
+In Hyperlight snapshots form a tree. You can restore an earlier snapshot and
+take a new one to create a separate branch.  Here is an example in Rust, where
+`first` and `second` share memory with `root` but not with each other:
+
+```rust
+// Our root snapshot
+let mut sandbox = ...;
+let root = sandbox.snapshot()?;
+
+// The first snapshot (branch 1)
+sandbox.call::<i32>("MyValue", 42)?;
+let first = sandbox.snapshot()?;
+
+// The second snapshot (branch 2)
+sandbox.restore(root)?;
+sandbox.call::<i32>("MyValue", 100)?;
+let second = sandbox.snapshot()?;
+```
+
+One caveat with layered snapshots is that layers are _immutable_, and so data in
+a previous layer remains accessible in later snapshots. This requires extra care
+when snapshots involve secrets: if a secret was snapshotted as part of one
+layer, it will remain accessible by the guest even if it was subsequently
+zeroed.
+
+## Resize scratch memory when taking a snapshot
+
+A guest may need more memory during initialization than it needs during the
+remainder of the program operation. Hyperlight now lets you give these stages
+different scratch sizes using
+[`SnapshotOptions`](https://docs.rs/hyperlight-host/0.19.0/hyperlight_host/sandbox/snapshot/struct.SnapshotOptions.html).
+This is for example the case with many interpreted languages, which consume more
+memory during the initial interpretation:
+
+```rust
+use hyperlight_host::SandboxBuilder;
+use hyperlight_host::sandbox::snapshot::SnapshotOptions;
+
+// Create a sandbox which boots with 8MiB of scratch.
+let mut sandbox = SandboxBuilder::from_file("guest.bin")
+    .scratch_size(8 * 1024 * 1024)
+    .build()?;
+    
+// ... Perform initialization work here.
+
+// Snapshot the sandbox, resizing scratch to 2MiB.
+let options = SnapshotOptions::default().scratch_size(2 * 1024 * 1024);
+let snapshot = sandbox.snapshot_with_options(&options)?;
+```
+
+You can now also inspect how much scratch the guest has allocated using
+`Sandbox::scratch_allocated_bytes`. It reports allocations since the last
+snapshot or restore. Though note that this value is guest-controlled, and should
+be used for diagnostics only.
+
+## Guest heap is now backed by scratch memory
+
+Heap memory in the guest is now backed by the scratch region, providing a single
+value to control. The heap size is now also *variable*, meaning it can continue
+to grow until it runs out of scratch space. As part of this change we’ve removed
+all `heap_size` controls, making `scratch_size` the only way to control heap sizes:
+
+```rust
+// before (0.18)
+let sandbox = SandboxBuilder::from_file(guest_path)
+    .heap_size(1024 * 1024)
+    .scratch_size(4 * 1024 * 1024)
+    .build()?;
+
+// after (0.19)
+let sandbox = SandboxBuilder::from_file(guest_path)
+    .scratch_size(5 * 1024 * 1024) // heap now draws from scratch
+    .build()?;
+```
+
+As a result of this change snapshots no longer contain a zero-filled heap
+region, making them smaller and faster to create, save, and load. Note that
+since the heap size now uses scratch memory, this may require a larger scratch
+size. Running out of scratch aborts the guest with `MallocFailed`, rather than
+returning a failed allocation.
