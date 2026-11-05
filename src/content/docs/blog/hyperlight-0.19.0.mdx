@@ -29,12 +29,6 @@ benchmark results targeting both MSHV on Linux 6.6 and KVM on Linux 6.17:
 | `snapshots/restore_alternate/large` | 4.41 ms → 106 µs (−98%) | 1.66 ms → 131 µs (−92%) |
 | `snapshots/restore/large`           | 1.2 ms → 91.6 µs (−92%) | 403 µs → 52 µs (−87%)   |
 
-There are however some downsides to these changes: the `load_snapshot` benchmark
-has seen a 14% regression, and the `save_snapshot` benchmark has seen a 10–22%
-regression. We believe those regressions are acceptable given how much faster
-it’s made the other snapshot operations. And we expect to be able to speed these
-operations up again in future patches.
-
 ## Layered snapshots
 
 Snapshots can now share memory between multiple layers using copy-on-write
@@ -101,9 +95,13 @@ be used for diagnostics only.
 ## Guest heap is now backed by scratch memory
 
 Heap memory in the guest is now backed by the scratch region, providing a single
-value to control. The heap size is now also *variable*, meaning it can continue
-to grow until it runs out of scratch space. As part of this change we’ve removed
-all `heap_size` controls, making `scratch_size` the only way to control heap sizes:
+value to control. As a result of this change snapshots no longer contain a
+zero-filled heap region, making them smaller and faster to create and load. As
+well as making heap operations on the guest faster.
+
+As the heap size now uses scratch memory, this may require a larger scratch
+size. As part of this change we’ve removed all `heap_size` controls, making
+`scratch_size` the only way to control heap size:
 
 ```rust
 // before (0.18)
@@ -117,9 +115,3 @@ let sandbox = SandboxBuilder::from_file(guest_path)
     .scratch_size(5 * 1024 * 1024) // heap now draws from scratch
     .build()?;
 ```
-
-As a result of this change snapshots no longer contain a zero-filled heap
-region, making them smaller and faster to create, save, and load. Note that
-since the heap size now uses scratch memory, this may require a larger scratch
-size. Running out of scratch aborts the guest with `MallocFailed`, rather than
-returning a failed allocation.
